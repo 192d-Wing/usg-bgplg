@@ -1,0 +1,44 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# Frontend
+node_modules/
+dist/
+build/
+.vite/
+.next/
+.turbo/
+*.local
+.eslintcache
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+*.swp
+*.swo
+
+# Logs / runtime
+*.log
+logs/
+coverage/
+.cache/
+.tmp/
+
+# Project-specific
+/data/
+/run/
+/snapshots/
