@@ -25,7 +25,7 @@ users via SSO. Read-only by construction.
 
 ## 2. Top-level architecture
 
-```
+```text
                           ┌──────────────────────────┐
                           │        Web UI            │
                           │  (Vite + React + TS)     │
@@ -40,13 +40,13 @@ users via SSO. Read-only by construction.
             ┌────────────────────────────┼─────────────────────────┐
             │                            │                         │
    ┌────────▼────────┐         ┌─────────▼────────┐       ┌────────▼────────┐
-   │  bgplg-bgp      │         │  bgplg-router    │       │   bgplg-probe   │
-   │  passive BGP    │         │  vendor adapters │       │  ICMP/UDP probes│
-   │  speaker        │         │  (gNMI, NETCONF, │       │  in-VRF via    │
-   │  (RFC 4271 +    │         │   IOS-XR XML,    │       │   network ns / │
-   │   AFI/SAFIs)    │         │   JunOS RPC,     │       │   VPP / FRR)   │
-   └────────┬────────┘         │   SR Linux JSON, │       └────────┬────────┘
-            │                  │   FRR vtysh)     │                │
+   │ bgplg-rustybgp  │         │  bgplg-router    │       │   bgplg-probe   │
+   │   gRPC client   │         │  vendor adapters │       │  ICMP/UDP probes│
+   │   to RustyBGP   │         │  (gNMI, NETCONF, │       │   in-VRF via    │
+   │  + BMP receiver │         │   IOS-XR XML,    │       │   network ns /  │
+   │   (fallback for │         │   JunOS RPC,     │       │   VPP / FRR)    │
+   │   missing SAFIs)│         │   FRR vtysh,     │       └────────┬────────┘
+   └────────┬────────┘         │   SR Linux JSON) │                │
             │                  └─────────┬────────┘                │
             │                            │                         │
             └─────────────► RIB store ◄──┘                         │
@@ -56,29 +56,39 @@ users via SSO. Read-only by construction.
                        ┌────────────────────────────────────────────┐
                        │   normalized result types (serde)          │
                        └────────────────────────────────────────────┘
+
+       ┌───────────────────────────────────┐
+       │   RustyBGP (separate process)     │  ← peers with PEs/RRs over BGP
+       │   github.com/osrg/rustybgp        │  ← exposes GoBGP-compatible gRPC
+       └───────────────────────────────────┘
 ```
 
-Two ways the looking glass can learn routing state — both supported, picked
-per-router in config:
+The looking glass uses **RustyBGP as its BGP data plane**. RustyBGP runs as a
+companion process — peering with PEs / route-reflectors — and exposes a
+GoBGP-compatible gRPC API. `bgplg-rustybgp` is a thin gRPC client that
+streams updates and route lookups out of RustyBGP into our normalized RIB.
 
-- **Speaker mode** (`bgplg-bgp`): we run a passive BGP speaker, peer the
-  router into us as a route-reflector client (or just a regular peer with
-  `route-reflector-client` from their side, or BMP). We hold the Adj-RIB-In
-  ourselves. Best fidelity, no per-query latency.
-- **Adapter mode** (`bgplg-router`): we shell out / RPC to the router on
-  demand (gNMI subscribe / NETCONF get / vtysh / vendor JSON-RPC). Easier to
-  deploy, slower, leaks operational queries onto the device.
+State can also be learned via:
 
-For the **MVP** we ship Speaker mode + a single FRR-vtysh adapter (trivial)
-to prove both paths.
+- **BMP receiver** (in-process, in `bgplg-rustybgp`): used for AFI/SAFIs that
+  RustyBGP does not yet parse (BGP-LS, SR-Policy, SRv6 Service — see §4).
+  We accept BMP from the device directly and decode the embedded BGP-UPDATE
+  ourselves, sidestepping RustyBGP for those families.
+- **Adapter mode** (`bgplg-router`): on-demand RPC into the router (gNMI /
+  NETCONF / vtysh / vendor JSON-RPC). Slower, leaks queries onto the device,
+  but useful as a backstop and for non-BGP info.
+
+For the **MVP** we ship the RustyBGP path with IPv4/IPv6 unicast +
+VPNv4/VPNv6 (whatever RustyBGP supports natively), plus a single FRR-vtysh
+adapter to prove the adapter path. BMP fallback lights up at M3/M4.
 
 ## 3. Crate / module layout (Rust workspace)
 
-```
+```text
 crates/
   bgplg-api/         binary  — axum HTTP + WebSocket; depends on the rest
   bgplg-core/        lib     — shared types: Prefix, RouteEntry, Vrf, Sid, etc.
-  bgplg-bgp/         lib     — passive BGP speaker (BMP optional)
+  bgplg-rustybgp/    lib     — gRPC client to RustyBGP + BMP receiver
   bgplg-rib/         lib     — in-mem RIB; per-VRF, per-AFI/SAFI tables
   bgplg-router/      lib     — vendor adapters (trait Router)
   bgplg-probe/       lib     — ping / traceroute, optionally VRF-scoped
@@ -125,39 +135,67 @@ pub struct RouteEntry {
 }
 ```
 
-## 4. BGP speaker (`bgplg-bgp`)
+## 4. BGP via RustyBGP (`bgplg-rustybgp`)
 
-We don't implement BGP from scratch in v1. Choices, in priority order:
+We do **not** implement BGP ourselves. We run [RustyBGP] as a companion
+process and drive it over its GoBGP-compatible gRPC API.
 
-1. **`holo-bgp`** (the Holo project) — pure-Rust, async, AFI/SAFI extensible.
-2. **`rotonda-fsm` + `routecore`** (NLnet Labs) — Rust BGP toolkit, very
-   active, BMP-friendly.
-3. Bind to **GoBGP** via gRPC if pure-Rust isn't fast enough to ship — easy
-   escape hatch.
+[RustyBGP]: https://github.com/osrg/rustybgp
 
-We will likely start with `routecore`/`rotonda-fsm` — message parsing is the
-hard part and they already cover MP-BGP for VPNv4/v6, labeled-unicast, BGP-LS,
-SR-Policy SAFI, and SRv6 service SIDs.
+### Why RustyBGP
 
-**Required AFI/SAFIs to advertise capabilities for:**
+- Same author as GoBGP, written in async Rust — fits our toolchain.
+- gRPC API is identical to GoBGP's, so the protobufs are stable and
+  well-documented (`proto/gobgp.proto` etc.).
+- Lets `usg-bgplg` stay focused on the *looking-glass* problem (RIB
+  modeling, VRF/SID semantics, UI) instead of BGP FSM + parser maintenance.
 
-- `1/1`   IPv4 unicast
-- `2/1`   IPv6 unicast
-- `1/4`   IPv4 labeled-unicast
-- `2/4`   IPv6 labeled-unicast
-- `1/128` VPNv4 unicast
-- `2/128` VPNv6 unicast
-- `1/73`  SR Policy IPv4         (RFC 9256 SAFI)
-- `2/73`  SR Policy IPv6
-- `16388/71` BGP-LS              (for topology / SR-MPLS / SRv6 TLVs)
-- `1/129` MCAST-VPN              (deferred)
+### How we use it
 
-We accept-only (egress-filter everything). Routes go straight into `bgplg-rib`.
+`bgplg-rustybgp` is a small library crate that:
 
-### BMP
+1. Spawns a `tonic` client against RustyBGP's gRPC endpoint.
+2. On startup, calls `ListPeer` / `ListPath` to seed the RIB.
+3. Subscribes to `WatchEvent` (UPDATE stream) and translates each path
+   into a `bgplg_core::RouteEntry`, posting it into `bgplg-rib`.
+4. Issues `AddPeer` calls based on `[[routers]]` config so RustyBGP comes
+   up with the right neighbors when we start.
 
-Optional but recommended: also accept BMP (RFC 7854) so we can passively
-mirror Adj-RIB-In/Out from devices that support it without full BGP peering.
+We never use RustyBGP to *originate* routes — looking-glass is read-only.
+RustyBGP runs with an empty Loc-RIB policy and we egress-filter everything
+(or just don't peer outbound).
+
+### Capability gaps and the BMP fallback
+
+RustyBGP's AFI/SAFI coverage is narrower than GoBGP's. The exact list shifts
+with upstream releases, so we **runtime-detect** what RustyBGP advertises and
+gracefully fall back to BMP for the rest. As of writing the picture is:
+
+| AFI/SAFI                 | Source           | Notes                                                   |
+| ------------------------ | ---------------- | ------------------------------------------------------- |
+| `1/1`   IPv4 unicast     | RustyBGP         | first-class                                             |
+| `2/1`   IPv6 unicast     | RustyBGP         | first-class                                             |
+| `1/4`   IPv4 lbl-unicast | RustyBGP / BMP   | verify per upstream release                             |
+| `2/4`   IPv6 lbl-unicast | RustyBGP / BMP   | verify per upstream release                             |
+| `1/128` VPNv4 unicast    | RustyBGP         | confirm path attribute decode coverage                  |
+| `2/128` VPNv6 unicast    | RustyBGP         | confirm path attribute decode coverage                  |
+| `1/73`  SR-Policy v4     | **BMP fallback** | parse SR-Policy attributes ourselves                    |
+| `2/73`  SR-Policy v6     | **BMP fallback** |                                                         |
+| `16388/71` BGP-LS        | **BMP fallback** | TLV decode in `bgplg-rustybgp::bmp`                     |
+| SRv6 Service (RFC 9252)  | RustyBGP / BMP   | depends on upstream prefix-SID + Srv6 attribute support |
+| `1/129` MCAST-VPN        | deferred         |                                                         |
+
+### BMP receiver
+
+Independent of RustyBGP, `bgplg-rustybgp::bmp` listens on a TCP port for BMP
+(RFC 7854) sessions from PEs/RRs. Each BMP PEER\_UP / ROUTE\_MONITORING
+message embeds a real BGP UPDATE, which we parse with our own MP-BGP decoder
+(this is the part of the project we *do* own, scoped to the AFI/SAFIs above).
+This is how we get BGP-LS, SR-Policy, SRv6 Service even if RustyBGP can't
+parse them.
+
+We accept-only — we never send updates back to peers (RustyBGP's policy
+engine handles ingress filtering, BMP is by definition receive-only).
 
 ## 5. RIB (`bgplg-rib`)
 
@@ -207,7 +245,7 @@ end-to-end stack. That's the differentiator vs. a vanilla looking glass.
 
 REST + SSE for streaming, WebSocket for live BGP UPDATE feeds (bonus).
 
-```
+```text
 GET  /api/v1/routers                              -> [RouterSummary]
 GET  /api/v1/vrfs?router=<id>                     -> [Vrf]
 GET  /api/v1/routes?prefix=&vrf=&afi=&safi=&...   -> [RouteEntry]
@@ -259,25 +297,34 @@ listen = "0.0.0.0:8443"
 tls_cert = "./certs/server.pem"
 tls_key  = "./certs/server.key"
 
-[bgp]
-router_id   = "10.0.0.1"
-local_as    = 65000
-listen      = "0.0.0.0:179"
-hold_time   = 90
-afi_safis   = ["ipv4-unicast", "ipv6-unicast", "ipv4-labeled-unicast",
-               "ipv6-labeled-unicast", "vpnv4", "vpnv6",
-               "sr-policy-v4", "sr-policy-v6", "bgp-ls"]
+# RustyBGP runs as a companion process (e.g. another container in the same pod).
+# We do not configure BGP listen/router-id here — that lives in RustyBGP's own
+# config. We just tell ourselves how to reach it.
+[rustybgp]
+grpc_endpoint = "http://127.0.0.1:50051"
+
+# Optional in-process BMP receiver for AFI/SAFIs RustyBGP doesn't decode
+# (BGP-LS, SR-Policy, SRv6 Service). Routers send BMP straight to us.
+[bmp]
+listen = "0.0.0.0:11019"
 
 [[routers]]
-id        = "pe1"
-peer_ip   = "10.0.0.11"
-remote_as = 65000
-mode      = "speaker"   # or "adapter"
+id          = "pe1"
+peer_ip     = "10.0.0.11"
+remote_as   = 65000
+source      = "rustybgp"   # RustyBGP will be told to peer with this neighbor
+afi_safis   = ["ipv4-unicast", "ipv6-unicast", "vpnv4", "vpnv6"]
 
 [[routers]]
-id        = "pe2"
-mode      = "adapter"
-adapter   = { kind = "frr-vtysh", host = "10.0.0.12", user = "lg" }
+id          = "pe2"
+peer_ip     = "10.0.0.12"
+source      = "bmp"        # this router streams BMP into us instead of BGP
+afi_safis   = ["bgp-ls", "sr-policy-v4", "sr-policy-v6"]
+
+[[routers]]
+id        = "pe3"
+source    = "adapter"      # on-demand RPC, no peering
+adapter   = { kind = "frr-vtysh", host = "10.0.0.13", user = "lg" }
 
 [[vrf_aliases]]   # human-friendly names for RDs we'll see
 rd   = "65000:100"
@@ -286,26 +333,32 @@ name = "RED"
 
 ## 11. Deployment
 
-- Single static binary for the API + speaker.
-- Frontend served as embedded static assets (`rust-embed`) so the deploy is
-  one container.
+- The looking glass ships as **two containers** that always run together:
+  1. `bgplg` — our axum API + embedded frontend (single static binary,
+     `rust-embed`).
+  2. `rustybgp` — the BGP data plane.
+- Networking: `rustybgp` binds `:179` for BGP and `:50051` for gRPC; `bgplg`
+  binds `:8443` for HTTPS and (optionally) `:11019` for BMP. In Kubernetes
+  they live in one Pod so gRPC stays on `localhost`.
 - Provided artifacts:
-  - `Dockerfile` (multi-stage: rust → distroless)
-  - `docker-compose.yml` for local dev (looking-glass + a small FRR lab)
-  - `Containerfile` mirror for podman
-  - Helm chart in `deploy/helm/` (post-MVP)
+  - `Dockerfile` for `bgplg` (multi-stage: rust → distroless).
+  - `docker-compose.yml` for local dev: `bgplg` + `rustybgp` + a small FRR
+    lab to peer against.
+  - `Containerfile` mirror for podman.
+  - Helm chart in `deploy/helm/` (post-MVP) that ships both containers in a
+    single Pod with a shared `emptyDir` for sockets/certs.
 
 ## 12. Roadmap / milestones
 
-| Milestone | Scope |
-|----|----|
-| **M0 – Skeleton (this PR)**       | Repo scaffolding, conventional commits, build green, hello-world API + UI. |
-| **M1 – Speaker MVP**              | Passive BGP, IPv4/IPv6 unicast only, in-mem RIB, REST `/routes` endpoint, basic UI. |
-| **M2 – VPNs**                     | VPNv4/VPNv6, per-VRF RIB, RD/RT model, VRF picker in UI. |
-| **M3 – Labels & SIDs**            | Labeled-unicast, SR-MPLS Prefix-SID, SRv6 Service SID decode + display. |
-| **M4 – BGP-LS + SR-Policy**       | Topology view, SR-Policy SAFI, segment-list rendering. |
-| **M5 – Probes**                   | In-VRF ping / traceroute via FRR adapter, SSE streaming in UI. |
-| **M6 – Hardening**                | Auth tokens, rate limit, audit log, Helm chart, docs site. |
+| Milestone                   | Scope                                                                                                |
+| --------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **M0 – Skeleton (done)**    | Repo scaffolding, conventional commits, build green, hello-world API + UI.                           |
+| **M1 – Speaker MVP**        | RustyBGP companion, gRPC plumbing, IPv4/IPv6 unicast, in-mem RIB, REST `/routes` endpoint, basic UI. |
+| **M2 – VPNs**               | VPNv4/VPNv6 via RustyBGP, per-VRF RIB, RD/RT model, VRF picker in UI.                                |
+| **M3 – Labels & SIDs**      | Labeled-unicast, SR-MPLS Prefix-SID, SRv6 Service SID decode + display (BMP path lights up).         |
+| **M4 – BGP-LS + SR-Policy** | Topology view, SR-Policy SAFI, segment-list rendering (BMP-fed).                                     |
+| **M5 – Probes**             | In-VRF ping / traceroute via FRR adapter, SSE streaming in UI.                                       |
+| **M6 – Hardening**          | Auth tokens, rate limit, audit log, Helm chart, docs site.                                           |
 
 ## 13. Open questions
 
@@ -316,3 +369,10 @@ name = "RED"
 3. Persistence: do we keep route history (time-series) or strictly snapshot
    the current view? History is hugely useful but expensive — flag for M7.
 4. License — MIT, Apache-2.0, or dual?
+5. **RustyBGP capability matrix:** before M2 starts, run the AFI/SAFI table
+   in §4 against the pinned RustyBGP version we plan to ship. Anything in
+   the "RustyBGP / BMP" rows needs a concrete decision: rely on RustyBGP,
+   land BMP fallback, or upstream the support to RustyBGP.
+6. **gRPC protobuf source:** vendor the `gobgp.proto` from RustyBGP's repo
+   into `crates/bgplg-rustybgp/proto/` and run `tonic-build` at compile
+   time, or take a pre-built crate? Vendoring is simpler and pins behavior.
