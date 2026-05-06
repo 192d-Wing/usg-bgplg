@@ -142,6 +142,14 @@ process and drive it over its GoBGP-compatible gRPC API.
 
 [RustyBGP]: https://github.com/osrg/rustybgp
 
+> **Pinned to upstream commit
+> [`9e2a907a`](https://github.com/osrg/rustybgp/commit/9e2a907a3c1ec82c2d648cbfb56a536d98ad2952)
+> (master @ 2026-04-25).** RustyBGP publishes no git tags, so we pin by
+> commit SHA. The protobuf schema is vendored under
+> [`crates/bgplg-rustybgp/proto/`](../crates/bgplg-rustybgp/proto/) — see
+> [`VENDOR.md`](../crates/bgplg-rustybgp/VENDOR.md) for the SHA-256
+> fingerprints and refresh procedure.
+
 ### Why RustyBGP
 
 - Same author as GoBGP, written in async Rust — fits our toolchain.
@@ -369,10 +377,15 @@ name = "RED"
 3. Persistence: do we keep route history (time-series) or strictly snapshot
    the current view? History is hugely useful but expensive — flag for M7.
 4. License — MIT, Apache-2.0, or dual?
-5. **RustyBGP capability matrix:** before M2 starts, run the AFI/SAFI table
-   in §4 against the pinned RustyBGP version we plan to ship. Anything in
-   the "RustyBGP / BMP" rows needs a concrete decision: rely on RustyBGP,
-   land BMP fallback, or upstream the support to RustyBGP.
-6. **gRPC protobuf source:** vendor the `gobgp.proto` from RustyBGP's repo
-   into `crates/bgplg-rustybgp/proto/` and run `tonic-build` at compile
-   time, or take a pre-built crate? Vendoring is simpler and pins behavior.
+5. ~~**RustyBGP capability matrix:** before M2 starts, run the AFI/SAFI table
+   in §4 against the pinned RustyBGP version we plan to ship.~~ **Resolved
+   (partly):** pinned to upstream commit `9e2a907a` (master @ 2026-04-25)
+   since RustyBGP does not cut tags. The empirical AFI/SAFI verification
+   (which families actually round-trip via gRPC vs. need the BMP fallback)
+   still happens during M1 once we have a peering harness running.
+6. ~~**gRPC protobuf source:** vendor the `gobgp.proto` from RustyBGP's repo,
+   or take a pre-built crate?~~ **Resolved:** vendored, see
+   [`crates/bgplg-rustybgp/proto/`](../crates/bgplg-rustybgp/proto/) and
+   [`VENDOR.md`](../crates/bgplg-rustybgp/VENDOR.md). Six files
+   (`gobgp.proto` + 5 imports), MIT-licensed in their headers (inherited
+   from GoBGP); the upstream Apache-2.0 LICENSE is preserved alongside.
