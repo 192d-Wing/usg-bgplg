@@ -181,6 +181,7 @@ dependencies = [
 name = "bgplg-rustybgp"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "bgplg-core",
  "prost",
  "prost-types",

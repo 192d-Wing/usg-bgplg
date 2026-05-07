@@ -1,0 +1,35 @@
+# RustyBGP looking-glass config for the M1 lab.
+#
+# We sit inside AS 65000 as a route-reflector. Both FRR PEs are RR clients,
+# so RustyBGP holds the merged Adj-RIB-In and reflects between them. We
+# advertise IPv4 + IPv6 unicast on each session.
+
+global:
+  config:
+    as: 65000
+    router-id: "10.0.0.1"
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.10.2"
+      peer-as: 65000
+    route-reflector:
+      config:
+        route-reflector-client: true
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+      - config:
+          afi-safi-name: ipv6-unicast
+
+  - config:
+      neighbor-address: "172.30.10.3"
+      peer-as: 65000
+    route-reflector:
+      config:
+        route-reflector-client: true
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+      - config:
+          afi-safi-name: ipv6-unicast

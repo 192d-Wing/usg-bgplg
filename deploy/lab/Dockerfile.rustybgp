@@ -1,0 +1,32 @@
+# Builds rustybgpd at a pinned upstream commit — no upstream Docker image
+# is published. RUSTYBGP_SHA must match crates/bgplg-rustybgp/VENDOR.md so
+# the gRPC schema we vendor stays compatible with what we run.
+ARG RUSTYBGP_SHA=9e2a907a3c1ec82c2d648cbfb56a536d98ad2952
+
+FROM rust:1.83-bookworm AS builder
+ARG RUSTYBGP_SHA
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends protobuf-compiler git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git init . \
+ && git remote add origin https://github.com/osrg/rustybgp.git \
+ && git fetch --depth=1 origin "${RUSTYBGP_SHA}" \
+ && git checkout FETCH_HEAD
+
+RUN cargo build --release --bin rustybgpd
+
+# --- runtime ---
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iproute2 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/rustybgpd /usr/local/bin/rustybgpd
+
+# 179 = BGP, 50051 = gRPC API (hardcoded in upstream daemon/src/event.rs).
+EXPOSE 179 50051
+ENTRYPOINT ["/usr/local/bin/rustybgpd"]
+CMD ["-f", "/etc/rustybgp.yaml"]

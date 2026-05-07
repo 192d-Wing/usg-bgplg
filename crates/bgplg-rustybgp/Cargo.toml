@@ -30,3 +30,10 @@ thiserror          = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+
+[[example]]
+name = "probe"
+path = "examples/probe.rs"

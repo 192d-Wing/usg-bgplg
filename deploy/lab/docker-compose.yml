@@ -1,0 +1,76 @@
+# M1 lab: a two-PE iBGP fabric reflected through RustyBGP.
+#
+#   ┌─────────────┐                ┌──────────────────┐                ┌─────────────┐
+#   │  frr-pe1    │  iBGP / v4+v6  │     rustybgp     │  iBGP / v4+v6  │  frr-pe2    │
+#   │  AS 65000   │ ◄────────────► │  AS 65000 (RR)   │ ◄────────────► │  AS 65000   │
+#   │  10.0.0.2   │   172.30.10.x  │   10.0.0.1       │                │  10.0.0.3   │
+#   └─────────────┘                └──────────────────┘                └─────────────┘
+#                                          ▲
+#                                          │ gRPC :50051 (host-mapped)
+#                                          ▼
+#                                   ┌──────────────────┐
+#                                   │  bgplg (host)    │  cargo run -p bgplg-api
+#                                   │  HTTP :8080      │
+#                                   └──────────────────┘
+#
+# Run:  docker compose -f deploy/lab/docker-compose.yml up --build
+# Then: cargo run -p bgplg-rustybgp --example probe
+
+name: usg-bgplg-lab
+
+networks:
+  fabric:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24
+          gateway: 172.30.10.254
+
+services:
+  rustybgp:
+    build:
+      context: .
+      dockerfile: Dockerfile.rustybgp
+    container_name: bgplg-lab-rustybgp
+    privileged: true
+    networks:
+      fabric:
+        ipv4_address: 172.30.10.1
+    ports:
+      - "127.0.0.1:50051:50051"   # gRPC API → reachable from host
+    volumes:
+      - ./rustybgp/rustybgp.yaml:/etc/rustybgp.yaml:ro
+    healthcheck:
+      # rustybgpd has no built-in healthcheck endpoint; just probe the gRPC TCP port.
+      test: ["CMD-SHELL", "ss -lnt | grep -q ':50051' || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+
+  frr-pe1:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: bgplg-lab-pe1
+    privileged: true
+    networks:
+      fabric:
+        ipv4_address: 172.30.10.2
+    volumes:
+      - ./frr-pe1/frr.conf:/etc/frr/frr.conf:ro
+      - ./frr-shared/daemons:/etc/frr/daemons:ro
+    depends_on:
+      rustybgp:
+        condition: service_healthy
+
+  frr-pe2:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: bgplg-lab-pe2
+    privileged: true
+    networks:
+      fabric:
+        ipv4_address: 172.30.10.3
+    volumes:
+      - ./frr-pe2/frr.conf:/etc/frr/frr.conf:ro
+      - ./frr-shared/daemons:/etc/frr/daemons:ro
+    depends_on:
+      rustybgp:
+        condition: service_healthy
